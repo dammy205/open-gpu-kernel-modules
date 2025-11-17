@@ -29,6 +29,17 @@
 #include "gpu/mem_mgr/ce_utils.h"
 #include "nvrm_registry.h"
 
+void
+_sysmemscrubFreeWorkerParams
+(
+    SysmemScrubberWorkerParams *pWorkerParams
+)
+{
+    if (pWorkerParams->pSpinlock != NULL)
+        portSyncSpinlockDestroy(pWorkerParams->pSpinlock);
+    portMemFree(pWorkerParams);
+}
+
 NV_STATUS
 sysmemscrubConstruct_IMPL
 (
@@ -47,7 +58,7 @@ sysmemscrubConstruct_IMPL
     pSysmemScrubber->pGpu = pGpu;
 
     // Disable by default until locking issues are addressed
-    pSysmemScrubber->bAsync = NV_FALSE;
+    pSysmemScrubber->bAsync = NV_TRUE;
 
     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_DISABLE_ASYNC_SYSMEM_SCRUB, &data32) == NV_OK)
     {
@@ -56,11 +67,13 @@ sysmemscrubConstruct_IMPL
 
     pWorkerParams = portMemAllocNonPaged(sizeof (*pWorkerParams));
     NV_ASSERT_OR_RETURN(pWorkerParams != NULL, NV_ERR_NO_MEMORY);
+    pWorkerParams->pSpinlock = portSyncSpinlockCreate(portMemAllocatorGetGlobalNonPaged());
+    NV_ASSERT_TRUE_OR_GOTO(status, pWorkerParams->pSpinlock != NULL, NV_ERR_NO_MEMORY, failed);
     pWorkerParams->pSysmemScrubber = pSysmemScrubber;
     pWorkerParams->refCount = 1;
     pSysmemScrubber->pWorkerParams = pWorkerParams;
 
-    listInit(&pSysmemScrubber->asyncScrubList, portMemAllocatorGetGlobalNonPaged());
+    listInitIntrusive(&pSysmemScrubber->asyncScrubList);
 
     ceUtilsAllocParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _ENABLE_COMPLETION_CB, _TRUE);
     NV_ASSERT_OK_OR_GOTO(status,
@@ -70,7 +83,7 @@ sysmemscrubConstruct_IMPL
 failed:
     if (status != NV_OK)
     {
-        portMemFree(pWorkerParams);
+        _sysmemscrubFreeWorkerParams(pWorkerParams);
     }
 
     return status;
@@ -80,24 +93,60 @@ static void
 _sysmemscrubProcessCompletedEntries
 (
     SysmemScrubber *pSysmemScrubber,
-    NvU64 lastCompleted
+    SysmemScrubberWorkerParams *pWorkerParams
 )
 {
     SysScrubEntry *pEntry;
+    SysScrubList freeList;
 
-    while ((pEntry = listHead(&pSysmemScrubber->asyncScrubList)) != NULL)
+    //
+    // Destructor sets pWorkerParams->pSysmemScrubber to NULL
+    // After that the workers need to return early
+    // Destructor is responsible for draining all the work iself
+    // This is done as destructor can't flush all the pending workers
+    //
+
+    listInitIntrusive(&freeList);
+
+    portSyncSpinlockAcquire(pWorkerParams->pSpinlock);
+
+    if (pSysmemScrubber == NULL)
     {
-        if (pEntry->semaphoreValue > lastCompleted)
-            break;
+        // Destructor passes pSysmemScrubber directly, as pWorkerParams->pSysmemScrubber is NULL by then (see below)
+        pSysmemScrubber = pWorkerParams->pSysmemScrubber;
+    }
 
+    if (pSysmemScrubber != NULL)
+    {
+        // ceutilsDestruct() ensures that the work is completed
+        NvU64 lastCompleted = (pSysmemScrubber->pCeUtils == NULL) ?
+            NV_U64_MAX : ceutilsUpdateProgress(pSysmemScrubber->pCeUtils);
+
+        while ((pEntry = listHead(&pSysmemScrubber->asyncScrubList)) != NULL)
+        {
+            if (pEntry->semaphoreValue > lastCompleted)
+                break;
+
+            listRemove(&pSysmemScrubber->asyncScrubList, pEntry);
+            listAppendExisting(&freeList, pEntry);
+        }
+    }
+
+    portSyncSpinlockRelease(pWorkerParams->pSpinlock);
+
+    while ((pEntry = listHead(&freeList)) != NULL)
+    {
         NV_PRINTF(LEVEL_INFO, "freeing scrubbed pMemDesc=%p RefCount=%u DupCount=%u\n",
             pEntry->pMemDesc, pEntry->pMemDesc->RefCount, pEntry->pMemDesc->DupCount);
 
         memdescFree(pEntry->pMemDesc);
         memdescDestroy(pEntry->pMemDesc);
 
-        listRemove(&pSysmemScrubber->asyncScrubList, pEntry);
+        listRemove(&freeList, pEntry);
+        portMemFree(pEntry);
     }
+
+    listDestroy(&freeList);
 }
 
 static void
@@ -108,46 +157,57 @@ _sysmemscrubProcessCompletedEntriesCb
 )
 {
     SysmemScrubberWorkerParams *pWorkerParams = pArg;
-    SysmemScrubber *pSysmemScrubber = pWorkerParams->pSysmemScrubber;
-
-    if (--pWorkerParams->refCount == 0)
-        portMemFree(pWorkerParams);
-
-    if (pSysmemScrubber == NULL)
-        return;
 
     NV_PRINTF(LEVEL_SILENT, "processing completed scrub work in deferred work item\n");
 
-    pSysmemScrubber->bCallbackQueued = NV_FALSE;
+    portAtomicSetU32(&pWorkerParams->bWorkerQueued, NV_FALSE);
 
-    _sysmemscrubProcessCompletedEntries(pSysmemScrubber, ceutilsUpdateProgress(pSysmemScrubber->pCeUtils));
+    _sysmemscrubProcessCompletedEntries(NULL, pWorkerParams);
+
+    if (portAtomicDecrementU32(&pWorkerParams->refCount) == 0)
+    {
+        _sysmemscrubFreeWorkerParams(pWorkerParams);
+    }
 }
 
 static NvBool
 _sysmemscrubIsWorkPending
 (
-    SysmemScrubber *pSysmemScrubber
+    SysmemScrubberWorkerParams *pWorkerParams
 )
 {
     // TODO: remove this function when CeUtils migrates to SemaphoreSurface
-    SysScrubEntry *pEntry = listHead(&pSysmemScrubber->asyncScrubList);
+    SysmemScrubber *pSysmemScrubber;
+    SysScrubEntry *pEntry;
+    NvBool bWorkPending = NV_FALSE;
 
-    return pEntry != NULL && pEntry->semaphoreValue <= ceutilsUpdateProgress(pSysmemScrubber->pCeUtils);
+    portSyncSpinlockAcquire(pWorkerParams->pSpinlock);
+    pSysmemScrubber = pWorkerParams->pSysmemScrubber;
+    if (pSysmemScrubber != NULL)
+    {
+        pEntry = listHead(&pSysmemScrubber->asyncScrubList);
+        bWorkPending = pEntry != NULL && pEntry->semaphoreValue <= ceutilsUpdateProgress(pSysmemScrubber->pCeUtils);
+    }
+    portSyncSpinlockRelease(pWorkerParams->pSpinlock);
+
+    return bWorkPending;
 }
 
 
 static void
 _sysmemscrubQueueProcessCompletedEntries(void *pArg)
 {
+    // The event handler can't get called after destructor, as the event gets deregistered
     SysmemScrubber *pSysmemScrubber = pArg;
     SysmemScrubberWorkerParams *pWorkerParams = pSysmemScrubber->pWorkerParams;
 
     NV_PRINTF(LEVEL_SILENT, "scrub completed callback\n");
 
-    NV_ASSERT_OR_RETURN_VOID(rmDeviceGpuLockIsOwner(pSysmemScrubber->pGpu->gpuInstance) || rmGpuLockIsOwner());
-
-    if (pWorkerParams->pSysmemScrubber == NULL || pSysmemScrubber->bCallbackQueued || !_sysmemscrubIsWorkPending(pSysmemScrubber))
+    if (portAtomicAddU32(&pWorkerParams->bWorkerQueued, 0) ||
+        !_sysmemscrubIsWorkPending(pWorkerParams))
+    {
         return;
+    }
 
     // queue work to run it outside interrupt context
     NV_ASSERT_OR_RETURN_VOID(
@@ -157,8 +217,8 @@ _sysmemscrubQueueProcessCompletedEntries(void *pArg)
                         OS_QUEUE_WORKITEM_FLAGS_LOCK_GPU_GROUP_DEVICE |
                         OS_QUEUE_WORKITEM_FLAGS_FULL_GPU_SANITY) == NV_OK);
 
-    pWorkerParams->refCount++;
-    pSysmemScrubber->bCallbackQueued = NV_TRUE;
+    portAtomicSetU32(&pWorkerParams->bWorkerQueued, NV_TRUE);
+    portAtomicIncrementU32(&pWorkerParams->refCount);
 }
 
 static NV_STATUS
@@ -176,10 +236,14 @@ _sysmemscrubScrubAndFreeAsync
         .pCompletionCallback = _sysmemscrubQueueProcessCompletedEntries,
         .pCompletionCallbackArg = pSysmemScrubber
     };
-    SysScrubEntry *pEntry = listAppendNew(&pSysmemScrubber->asyncScrubList);
+    SysmemScrubberWorkerParams *pWorkerParams = pSysmemScrubber->pWorkerParams;
+    SysScrubEntry *pEntry = portMemAllocNonPaged(sizeof (*pEntry));
     NV_STATUS status;
 
     NV_ASSERT_OR_RETURN(pEntry != NULL, NV_ERR_NO_MEMORY);
+
+    portSyncSpinlockAcquire(pWorkerParams->pSpinlock);
+    listAppendExisting(&pSysmemScrubber->asyncScrubList, pEntry);
 
     //
     // RM might be holding memory references despite memory is freed by the user
@@ -203,7 +267,9 @@ _sysmemscrubScrubAndFreeAsync
     else
     {
         listRemove(&pSysmemScrubber->asyncScrubList, pEntry);
+        portMemFree(pEntry);
     }
+    portSyncSpinlockRelease(pWorkerParams->pSpinlock);
 
     return status;
 }
@@ -237,7 +303,7 @@ sysmemscrubScrubAndFree_IMPL
     NV_ASSERT(pMemDesc->Size == pMemDesc->ActualSize);
 
     // WAR: currently queuing work out of ISR can fail, clean it up here
-    _sysmemscrubProcessCompletedEntries(pSysmemScrubber, ceutilsUpdateProgress(pSysmemScrubber->pCeUtils));
+    _sysmemscrubProcessCompletedEntries(NULL, pSysmemScrubber->pWorkerParams);
 
     if (pSysmemScrubber->bAsync &&
         _sysmemscrubScrubAndFreeAsync(pSysmemScrubber, pMemDesc) == NV_OK)
@@ -258,13 +324,18 @@ sysmemscrubDestruct_IMPL
 {
     SysmemScrubberWorkerParams *pWorkerParams = pSysmemScrubber->pWorkerParams;
 
+    portSyncSpinlockAcquire(pWorkerParams->pSpinlock);
     pWorkerParams->pSysmemScrubber = NULL;
+    portSyncSpinlockRelease(pWorkerParams->pSpinlock);
 
     objDelete(pSysmemScrubber->pCeUtils);
-    _sysmemscrubProcessCompletedEntries(pSysmemScrubber, NV_U64_MAX);
+    pSysmemScrubber->pCeUtils = NULL;
 
-    if (--pWorkerParams->refCount == 0)
-        portMemFree(pWorkerParams);
+    // pWorkerParams->pSysmemScrubber is NULL, so wokers won't run at this point
+    _sysmemscrubProcessCompletedEntries(pSysmemScrubber, pWorkerParams);
+
+    if (portAtomicDecrementU32(&pWorkerParams->refCount) == 0)
+        _sysmemscrubFreeWorkerParams(pWorkerParams);
 
     NV_ASSERT(listCount(&pSysmemScrubber->asyncScrubList) == 0);
     listDestroy(&pSysmemScrubber->asyncScrubList);

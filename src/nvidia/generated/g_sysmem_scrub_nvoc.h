@@ -78,14 +78,21 @@ typedef struct
 {
     MEMORY_DESCRIPTOR *pMemDesc;
     NvU64 semaphoreValue;
+    NODE listNode;
 } SysScrubEntry;
 
-MAKE_LIST(SysScrubList, SysScrubEntry);
+MAKE_INTRUSIVE_LIST(SysScrubList, SysScrubEntry, listNode);
 
 typedef struct
 {
+    // semaphore event handle doesn't take GPU lock
+    PORT_SPINLOCK *pSpinlock;
+
+    // spinlock needs to be taken to use pSysmemScrubber
     struct SysmemScrubber *pSysmemScrubber;
+
     NvU32 refCount;
+    NvU32 bWorkerQueued;
 } SysmemScrubberWorkerParams;
 
 
@@ -124,7 +131,6 @@ struct SysmemScrubber {
     struct CeUtils *pCeUtils;
     SysScrubList asyncScrubList;
     NvBool bAsync;
-    NvBool bCallbackQueued;
     SysmemScrubberWorkerParams *pWorkerParams;
 };
 
